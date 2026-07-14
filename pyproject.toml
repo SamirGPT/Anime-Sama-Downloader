@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anime-sama-downloader"
+version = "4.1.1"
+description = "Téléchargeur robuste + chatbot IA (Groq/Qwen3 via requests) pour anime-sama.to + voiranime.rip — Termux/Ubuntu edition"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "GPL-3.0" }
+authors = [
+    { name = "SamirGPT" }
+]
+keywords = ["anime", "downloader", "anime-sama", "voiranime", "termux", "ubuntu"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "tqdm>=4.66.0",
+    "av>=12.0.0",
+    "pycryptodome>=3.20.0",
+    "urllib3>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/SamirGPT/Anime-Sama-Downloader"
+Repository = "https://github.com/SamirGPT/Anime-Sama-Downloader"
+Issues = "https://github.com/SamirGPT/Anime-Sama-Downloader/issues"
+
+[project.scripts]
+anime-sama-downloader = "src.cli:main"
+asd = "src.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
