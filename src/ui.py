@@ -125,8 +125,8 @@ def print_header() -> None:
     print(f"""
 {Colors.HEADER}{Colors.BOLD}
 ╔══════════════════════════════════════════════════════════════╗
-║              ANIME-SAMA DOWNLOADER  v4.0                     ║
-║         Multi-sites • Termux / Ubuntu edition                ║
+║              ANIME-SAMA DOWNLOADER  v5.0                     ║
+║       Multi-sites • 18 players • Termux/Ubuntu edition       ║
 ╚══════════════════════════════════════════════════════════════╝
 {Colors.ENDC}
 {Colors.OKCYAN}Télécharge animes & scans depuis anime-sama.to + voiranime.rip{Colors.ENDC}

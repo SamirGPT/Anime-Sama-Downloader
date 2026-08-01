@@ -442,6 +442,8 @@ Exemples:
                    help="Override max_workers (épisodes parallèles)")
     p.add_argument("--max-segment-workers", type=int, default=None,
                    help="Override max_segment_workers (segments .ts parallèles)")
+    p.add_argument("--quality", choices=["fhd", "hd", "sd", "auto"], default="auto",
+                   help="Qualité préférée pour M3U8 (fhd=1080p, hd=720p, sd=480p, auto=meilleure)")
     p.add_argument("--site", default=None,
                    help="Forcer le site (anime-sama, voiranime)")
     return p
@@ -721,6 +723,7 @@ def _process_url(base_url: str, args, headers, interactive: bool) -> int:
 
     # Download
     failed = 0
+    prefer_q = args.quality if args.quality and args.quality != "auto" else None
     try:
         if use_threading and len(ep_nums) > 1:
             print_status(f"Mode parallèle ({max_w} workers)", "info")
@@ -728,7 +731,7 @@ def _process_url(base_url: str, args, headers, interactive: bool) -> int:
                 futures = {
                     ex.submit(download_episode, n, u, vs, anime_name, save_dir,
                               use_ts_threading, automatic_mp4, tool, no_mal,
-                              interactive): n
+                              interactive, prefer_q): n
                     for n, u, vs in zip(ep_nums, ep_urls, video_sources)
                 }
                 for future in as_completed(futures):
@@ -749,6 +752,7 @@ def _process_url(base_url: str, args, headers, interactive: bool) -> int:
                     tool=tool,
                     no_mal=no_mal,
                     interactive=interactive,
+                    prefer_quality=prefer_q,
                 )
                 if not ok:
                     failed += 1

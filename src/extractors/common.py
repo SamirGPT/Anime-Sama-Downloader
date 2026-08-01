@@ -133,10 +133,15 @@ def find_m3u8_in_code(code: str) -> Optional[str]:
     return None
 
 
-def select_best_variant(master_url: str) -> Optional[str]:
-    """Fetch a master.m3u8 and return the variant with the highest bandwidth.
+def select_best_variant(master_url: str, prefer_quality: Optional[str] = None) -> Optional[str]:
+    """Fetch a master.m3u8 and return the variant URL.
 
-    Returns the absolute URL of the best variant playlist, or None on failure.
+    Args:
+        master_url: URL of the master playlist.
+        prefer_quality: 'fhd' (1080p), 'hd' (720p), 'sd' (480p), or None (auto-best).
+
+    Returns:
+        The absolute URL of the chosen variant, or None on failure.
     """
     try:
         text = network.get_text(master_url, timeout=15)
@@ -144,14 +149,15 @@ def select_best_variant(master_url: str) -> Optional[str]:
         print_status(f"Could not fetch master playlist: {e}", "error")
         return None
 
-    best_bw = -1
-    best_url: Optional[str] = None
+    variants: List[Tuple[int, int, str]] = []  # (bandwidth, resolution, url)
     lines = text.splitlines()
     for i, line in enumerate(lines):
         line = line.strip()
         if line.startswith("#EXT-X-STREAM-INF"):
             bw_m = re.search(r'BANDWIDTH=(\d+)', line)
             bw = int(bw_m.group(1)) if bw_m else 0
+            res_m = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            height = int(res_m.group(2)) if res_m else 0
             for j in range(i + 1, len(lines)):
                 next_line = lines[j].strip()
                 if not next_line:
@@ -161,13 +167,76 @@ def select_best_variant(master_url: str) -> Optional[str]:
                 candidate = next_line
                 if not candidate.startswith("http"):
                     candidate = urljoin(master_url, candidate)
-                if bw > best_bw:
-                    best_bw = bw
-                    best_url = candidate
+                variants.append((bw, height, candidate))
                 break
-    if best_url:
-        print_debug(f"Selected variant: {best_url} (bw={best_bw})")
-    return best_url
+
+    if not variants:
+        return None
+
+    # If user wants a specific quality, find the closest match
+    if prefer_quality:
+        target_map = {"fhd": 1080, "hd": 720, "sd": 480}
+        target = target_map.get(prefer_quality.lower(), 1080)
+        # Find variant closest to (but not above if possible) the target height
+        # Prefer variants that match exactly, then closest below, then closest above
+        exact = [v for v in variants if v[1] == target]
+        if exact:
+            chosen = max(exact, key=lambda x: x[0])
+        else:
+            below = [v for v in variants if v[1] <= target]
+            if below:
+                chosen = max(below, key=lambda x: x[1])
+            else:
+                chosen = min(variants, key=lambda x: x[1])
+        print_debug(f"Selected variant: {chosen[2][:60]} ({chosen[1]}p, bw={chosen[0]})")
+        return chosen[2]
+
+    # Default: pick highest bandwidth
+    best = max(variants, key=lambda x: x[0])
+    print_debug(f"Selected variant: {best[2][:60]} ({best[1]}p, bw={best[0]})")
+    return best[2]
+
+
+def list_variants(master_url: str) -> List[Dict[str, Any]]:
+    """List all available quality variants in a master playlist.
+
+    Returns a list of dicts: [{"url":..., "bandwidth":..., "resolution":"WxH", "height":N}, ...]
+    Sorted by height descending (best quality first).
+    """
+    from typing import Any
+    try:
+        text = network.get_text(master_url, timeout=15)
+    except Exception:
+        return []
+
+    variants: List[Dict[str, Any]] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bw_m = re.search(r'BANDWIDTH=(\d+)', line)
+            bw = int(bw_m.group(1)) if bw_m else 0
+            res_m = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            width = int(res_m.group(1)) if res_m else 0
+            height = int(res_m.group(2)) if res_m else 0
+            for j in range(i + 1, len(lines)):
+                next_line = lines[j].strip()
+                if not next_line:
+                    continue
+                if next_line.startswith("#"):
+                    continue
+                candidate = next_line
+                if not candidate.startswith("http"):
+                    candidate = urljoin(master_url, candidate)
+                variants.append({
+                    "url": candidate,
+                    "bandwidth": bw,
+                    "resolution": f"{width}x{height}" if width and height else "?",
+                    "height": height,
+                })
+                break
+    variants.sort(key=lambda v: v["height"], reverse=True)
+    return variants
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +265,16 @@ def _parse_ext_x_map(line: str, base_url: str) -> Optional[str]:
     return uri
 
 
-def extract_segments(playlist_url: str) -> Optional[PlaylistInfo]:
+def extract_segments(playlist_url: str,
+                     prefer_quality: Optional[str] = None) -> Optional[PlaylistInfo]:
     """Fetch an m3u8 playlist and return PlaylistInfo.
 
+    Args:
+        playlist_url: URL of the playlist (master or media).
+        prefer_quality: 'fhd' (1080p), 'hd' (720p), 'sd' (480p), or None (auto-best).
+
     Handles:
-      - Master playlists (recurses into best variant)
+      - Master playlists (recurses into chosen variant, respecting prefer_quality)
       - MPEG-TS media playlists (returns segments only, is_fmp4=False)
       - fMP4 / CMAF playlists (returns init_segment + segments, is_fmp4=True)
 
@@ -213,11 +287,11 @@ def extract_segments(playlist_url: str) -> Optional[PlaylistInfo]:
         print_status(f"Could not fetch playlist: {e}", "error")
         return None
 
-    # If it's a master playlist, recurse into the best variant
+    # If it's a master playlist, recurse into the chosen variant
     if "#EXT-X-STREAM-INF" in text:
-        best = select_best_variant(playlist_url)
+        best = select_best_variant(playlist_url, prefer_quality=prefer_quality)
         if best and best != playlist_url:
-            return extract_segments(best)
+            return extract_segments(best, prefer_quality=prefer_quality)
         return None
 
     base = playlist_url
@@ -230,7 +304,6 @@ def extract_segments(playlist_url: str) -> Optional[PlaylistInfo]:
         if not line:
             continue
 
-        # Comment line — but check for #EXT-X-MAP first
         if line.startswith("#"):
             if line.upper().startswith("#EXT-X-MAP"):
                 init_url = _parse_ext_x_map(line, base)
@@ -239,7 +312,6 @@ def extract_segments(playlist_url: str) -> Optional[PlaylistInfo]:
                     is_fmp4 = True
             continue
 
-        # Media segment URL
         if not line.startswith("http"):
             line = urljoin(base, line)
         segments.append(line)

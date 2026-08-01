@@ -43,10 +43,12 @@ def search_anime(query: str, site: str = "anime-sama") -> str:
 
 def download(url: str, episodes: str = "latest", site: str = "auto",
              mp4: bool = True, fast: bool = True, threads: bool = False,
-             player: Optional[str] = None) -> str:
+             player: Optional[str] = None,
+             quality: Optional[str] = None) -> str:
     """Download episodes from a URL.
     episodes: 'latest', 'all', '1', '1-10', '1,3,5'
     site: 'auto' (detect from URL), 'anime-sama', 'voiranime'
+    quality: 'fhd' (1080p), 'hd' (720p), 'sd' (480p), or None (auto-best)
     """
     try:
         from src.sites import get_site_for_url, get_site_by_key, SiteNotFound
@@ -128,7 +130,7 @@ def download(url: str, episodes: str = "latest", site: str = "auto",
             with ThreadPoolExecutor(max_workers=max_w) as ex:
                 futures = {
                     ex.submit(download_episode, n, u, vs, anime_name, save_dir,
-                              fast, mp4, cfg.convert_tool, True, False): n
+                              fast, mp4, cfg.convert_tool, True, False, quality): n
                     for n, u, vs in zip(ep_nums, ep_urls, video_sources)
                 }
                 for future in as_completed(futures):
@@ -147,6 +149,7 @@ def download(url: str, episodes: str = "latest", site: str = "auto",
                     tool=cfg.convert_tool,
                     no_mal=True,
                     interactive=False,
+                    prefer_quality=quality,
                 )
                 if not ok:
                     failed += 1
@@ -406,6 +409,9 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "threads": {"type": "boolean", "default": False,
                                 "description": "Épisodes parallèles"},
                     "player": {"type": "string", "description": "Player spécifique (Sibnet, etc.)"},
+                    "quality": {"type": "string",
+                                "description": "Qualité: 'fhd' (1080p), 'hd' (720p), 'sd' (480p), ou null (auto)",
+                                "enum": ["fhd", "hd", "sd"]},
                 },
                 "required": ["url"],
             },

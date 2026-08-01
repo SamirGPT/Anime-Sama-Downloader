@@ -1,5 +1,14 @@
 """Embed4me extractor — AES-CBC encrypted API response.
 
+v5.0 FIX: The API returns URLs with a raw IP address (e.g. https://203.188.166.47/...).
+The server refuses these with HTTP 403 because:
+  1. The Host header is the IP, not the expected domain
+  2. No Referer header from the embed4me domain
+
+Solution: Replace the IP with the embed4me CDN domain (lpayer.embed4me.com)
+and send proper Host + Referer headers. This was causing the 403 error
+reported by users.
+
 The AES key/IV are hardcoded by the service (this is the service's own
 obfuscation, not a vulnerability in our code). We decrypt the response
 to get the M3U8 source URL.
@@ -10,15 +19,18 @@ import re
 import json
 import binascii
 from typing import Optional
+from urllib.parse import urlparse
 
 from src import network
-from src.ui import print_status
+from src.ui import print_status, print_debug
 
 
-# Service-imposed static key/IV (NOT a security issue — this is the
-# obfuscation the service itself uses; the key is shipped in their JS).
+# Service-imposed static key/IV (shipped in their JS)
 KEY = b"kiemtienmua911ca"
 IV = b"1234567890oiuytr"
+
+# The CDN domain that should be used instead of the raw IP
+EMBED4ME_CDN_DOMAIN = "lpayer.embed4me.com"
 
 
 def _decrypt(hex_str: str) -> Optional[str]:
@@ -38,7 +50,34 @@ def _decrypt(hex_str: str) -> Optional[str]:
         return None
 
 
+def _fix_embed4me_url(url: str) -> str:
+    """Fix an embed4me CDN URL by replacing the raw IP with the proper domain.
+
+    The API returns URLs like: https://203.188.166.47/v4/.../master.m3u8
+    The server refuses these with 403 because the Host header is the IP.
+    Replace with: https://lpayer.embed4me.com/v4/.../master.m3u8
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        # If the hostname is an IP address, replace it
+        host = parsed.hostname
+        if host and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
+            new_url = url.replace(f"://{host}", f"://{EMBED4ME_CDN_DOMAIN}", 1)
+            print_debug(f"Embed4me: IP {host} → {EMBED4ME_CDN_DOMAIN}")
+            return new_url
+    except Exception:
+        pass
+    return url
+
+
 def extract_embed4me(url: str) -> Optional[str]:
+    """Extract the M3U8 URL from an Embed4me embed page.
+
+    Returns a URL that has been fixed (raw IPs replaced with the CDN domain)
+    so that downstream requests don't get 403 errors.
+    """
     # Extract video ID from URL fragment or query
     m = re.search(r'#([a-zA-Z0-9]+)', url)
     if not m:
@@ -49,11 +88,13 @@ def extract_embed4me(url: str) -> Optional[str]:
 
     video_id = m.group(1)
     api_url = (
-        f"https://lpayer.embed4me.com/api/v1/video?id={video_id}"
-        f"&w=1920&h=1080&r=https://lpayer.embed4me.com/"
+        f"https://{EMBED4ME_CDN_DOMAIN}/api/v1/video?id={video_id}"
+        f"&w=1920&h=1080&r=https://{EMBED4ME_CDN_DOMAIN}/"
     )
     headers = {
-        "Referer": "https://lpayer.embed4me.com/",
+        "Referer": f"https://{EMBED4ME_CDN_DOMAIN}/",
+        "Origin": f"https://{EMBED4ME_CDN_DOMAIN}",
+        "Accept": "application/json, text/plain, */*",
     }
 
     try:
@@ -77,4 +118,16 @@ def extract_embed4me(url: str) -> Optional[str]:
     except json.JSONDecodeError:
         print_status("Embed4me: réponse JSON invalide", "warning")
         return None
-    return data.get("source")
+
+    source = data.get("source")
+    if not source:
+        return None
+
+    # FIX: Replace raw IP in the URL with the CDN domain
+    fixed_source = _fix_embed4me_url(source)
+    if fixed_source != source:
+        print_status(
+            f"Embed4me: URL corrigée (IP → {EMBED4ME_CDN_DOMAIN})",
+            "info",
+        )
+    return fixed_source

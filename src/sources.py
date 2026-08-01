@@ -1,7 +1,14 @@
 """Catalog of supported video sources and their metadata.
 
-Centralizes the player/domain knowledge that was scattered across
-`src/var.py`, `src/utils/print/print_episodes.py`, etc.
+v5.0: Added 8 new players (Doodstream, Streamtape, Mixdrop, Vidoza,
+Streamlare, Upstream, FileLions, HubCloud). Total: 18 supported sources.
+
+Each Source entry maps a domain pattern to:
+  - key: internal identifier
+  - display: user-facing name
+  - domains: list of substrings to match in URLs (lowercase)
+  - supported: whether we have an extractor for it
+  - notes: short description
 """
 from __future__ import annotations
 
@@ -16,6 +23,7 @@ class Source:
     domains: List[str]     # list of matching domains (lowercase)
     supported: bool = True
     notes: str = ""
+    quality: str = ""      # typical quality (e.g. "up to 1080p")
 
     def matches(self, url: str) -> bool:
         u = url.lower()
@@ -23,20 +31,57 @@ class Source:
 
 
 # Ordered list — the first matching source wins.
+# Quality info helps users choose (FHD > HD > 720p)
 SOURCES: List[Source] = [
-    Source("sendvid",   "SendVid",   ["sendvid.com"],            notes="Direct MP4, recommended"),
-    Source("sibnet",    "Sibnet",    ["video.sibnet.ru"],        notes="Direct MP4"),
-    Source("uqload",    "Uqload",    ["uqload.is", "uqload."],   notes="M3U8 HLS"),
-    Source("vidmoly",   "Vidmoly",   ["vidmoly.net", "vidmoly.to", "vidmoly.biz"], notes="M3U8 HLS"),
-    Source("oneupload", "OneUpload", ["oneupload.net", "oneupload.to"], notes="M3U8 HLS"),
-    Source("embed4me",  "Embed4me",  ["embed4me.com", "lpayer.embed4me.com"], notes="AES-encrypted M3U8"),
-    Source("movearnpre","Movearnpre",["movearnpre.com", "ovaltinecdn.com"], notes="Packed JS M3U8 (inconsistent)"),
-    Source("smoothpre", "Smoothpre", ["smoothpre.com"],          notes="Packed JS M3U8 (inconsistent)"),
-    Source("mivalyo",   "Mivalyo",   ["mivalyo.com"],            notes="Packed JS M3U8 (inconsistent)"),
-    Source("dingtezuni","Dingtezuni",["dingtezuni.com"],         notes="Packed JS M3U8 (inconsistent)"),
-    # Deprecated / unsupported (kept for display purposes)
-    Source("vk",        "VK",        ["vk.com"], supported=False, notes="Unsupported"),
-    Source("myvi",      "Myvi",      ["myvi.tv", "myvi.top"], supported=False, notes="Malicious — ads only"),
+    # --- Tier 1: Direct MP4, fastest ---
+    Source("sendvid",   "SendVid",   ["sendvid.com"],
+           notes="Direct MP4", quality="up to 1080p FHD"),
+    Source("sibnet",    "Sibnet",    ["video.sibnet.ru", "sibnet.ru"],
+           notes="Direct MP4", quality="720p HD"),
+
+    # --- Tier 2: HLS M3U8 (need segment download) ---
+    Source("uqload",    "Uqload",    ["uqload.is", "uqload."],
+           notes="M3U8 HLS", quality="up to 1080p"),
+    Source("vidmoly",   "Vidmoly",   ["vidmoly.net", "vidmoly.to", "vidmoly.biz"],
+           notes="M3U8 HLS (fMP4)", quality="up to 1080p FHD"),
+    Source("oneupload", "OneUpload", ["oneupload.net", "oneupload.to"],
+           notes="M3U8 HLS", quality="up to 1080p"),
+    Source("embed4me",  "Embed4me",  ["embed4me.com", "lpayer.embed4me.com"],
+           notes="AES-encrypted M3U8", quality="up to 1080p"),
+
+    # --- Tier 3: Packed-JS M3U8 (inconsistent) ---
+    Source("movearnpre","Movearnpre",["movearnpre.com", "ovaltinecdn.com"],
+           notes="Packed JS", quality="variable"),
+    Source("smoothpre", "Smoothpre", ["smoothpre.com"],
+           notes="Packed JS", quality="variable"),
+    Source("mivalyo",   "Mivalyo",   ["mivalyo.com"],
+           notes="Packed JS", quality="variable"),
+    Source("dingtezuni","Dingtezuni",["dingtezuni.com"],
+           notes="Packed JS", quality="variable"),
+
+    # --- Tier 4: NEW v5.0 — popular streaming hosts ---
+    Source("doodstream","Doodstream",["doodstream", "dood.so", "doodstream.com"],
+           notes="Direct MP4 via API", quality="up to 1080p"),
+    Source("streamtape","Streamtape",["streamtape", "streamtape.com"],
+           notes="Direct MP4 via API", quality="up to 1080p"),
+    Source("mixdrop",   "Mixdrop",   ["mixdrop", "mixdrop.co", "mixdrop.to"],
+           notes="Direct MP4", quality="up to 1080p"),
+    Source("vidoza",    "Vidoza",    ["vidoza.net"],
+           notes="Direct MP4", quality="up to 1080p"),
+    Source("streamlare", "Streamlare", ["streamlare.com"],
+           notes="Direct MP4", quality="up to 1080p"),
+    Source("upstream",  "Upstream",  ["upstream.to", "upstream"],
+           notes="Direct MP4", quality="up to 1080p"),
+    Source("filelions", "FileLions", ["filelions", "filelions.to"],
+           notes="M3U8 HLS", quality="up to 1080p"),
+    Source("hubcloud",  "HubCloud",  ["hubcloud", "hubcloud.cc"],
+           notes="Direct MP4", quality="up to 1080p"),
+
+    # --- Deprecated / unsupported ---
+    Source("vk",        "VK",        ["vk.com"],
+           supported=False, notes="Unsupported"),
+    Source("myvi",      "Myvi",      ["myvi.tv", "myvi.top"],
+           supported=False, notes="Malicious — ads only"),
 ]
 
 SOURCES_BY_KEY: Dict[str, Source] = {s.key: s for s in SOURCES}
@@ -64,5 +109,5 @@ def source_label(url: str) -> str:
     return s.display
 
 
-# Backwards-compatible flat list of valid player domains (used by listing).
+# Backwards-compatible flat list of valid player domains
 ALL_DOMAINS: List[str] = [d for s in SOURCES for d in s.domains if s.supported]

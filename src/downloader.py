@@ -36,7 +36,8 @@ def download_episode(episode_num, url, video_source, anime_name, save_dir,
                      automatic_mp4: bool = True,
                      tool: str = "auto",
                      no_mal: bool = True,
-                     interactive: bool = True) -> Tuple[bool, Optional[str]]:
+                     interactive: bool = True,
+                     prefer_quality: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     if not video_source:
         print_status(f"Pas de source vidéo pour épisode {episode_num}", "error")
         return False, None
@@ -73,6 +74,7 @@ def download_episode(episode_num, url, video_source, anime_name, save_dir,
             page_url=url,
             automatic_mp4=automatic_mp4,
             tool=tool,
+            prefer_quality=prefer_quality,
         )
     except KeyboardInterrupt:
         print_status("Interrompu — nettoyage...", "warning")
@@ -150,7 +152,8 @@ def download_video(video_url: str, save_path: str,
                    use_ts_threading: bool = False,
                    page_url: str = '',
                    automatic_mp4: bool = True,
-                   tool: str = "auto") -> Tuple[bool, Optional[str]]:
+                   tool: str = "auto",
+                   prefer_quality: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     print_status(f"Démarrage: {os.path.basename(save_path)}", "loading")
 
     referer = "https://vidmoly.net/"
@@ -176,6 +179,7 @@ def download_video(video_url: str, save_path: str,
             video_url, save_path,
             headers=headers,
             use_threads=use_ts_threading,
+            prefer_quality=prefer_quality,
         )
 
     return _download_direct(video_url, save_path, headers=headers)
@@ -230,10 +234,11 @@ def _download_direct(video_url: str, save_path: str,
 # ---------------------------------------------------------------------------
 def _download_m3u8(m3u8_url: str, save_path: str,
                    headers: dict,
-                   use_threads: bool) -> Tuple[bool, Optional[str]]:
+                   use_threads: bool,
+                   prefer_quality: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     from src.extractors.common import extract_segments, PlaylistInfo
 
-    playlist = extract_segments(m3u8_url)
+    playlist = extract_segments(m3u8_url, prefer_quality=prefer_quality)
     if not playlist or not playlist.segments:
         return False, None
 

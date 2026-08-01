@@ -1,5 +1,9 @@
 """Extractors package — dispatches by URL domain.
 
+v5.0: Added 8 new extractors (Doodstream, Streamtape, Mixdrop, Vidoza,
+Streamlare, Upstream, FileLions, HubCloud) via the generic MP4 pattern
+matcher and dedicated extractors for Doodstream/Streamtape.
+
 Usage:
     from src.extractors import fetch_video_source
     source = fetch_video_source(url)
@@ -17,6 +21,14 @@ from .vidmoly import extract_vidmoly
 from .oneupload import extract_oneupload
 from .embed4me import extract_embed4me
 from .movearnpre import extract_movearnpre_family
+from .doodstream import extract_doodstream
+from .streamtape import extract_streamtape
+from .mixdrop import extract_mixdrop
+from .vidoza import extract_vidoza
+from .streamlare import extract_streamlare
+from .upstream import extract_upstream
+from .filelions import extract_filelions
+from .hubcloud import extract_hubcloud
 
 
 def _process_single(url: str) -> Optional[str]:
@@ -35,31 +47,64 @@ def _process_single(url: str) -> Optional[str]:
             print_status("VoirAnime: aucune source vidéo trouvée sur la page", "warning")
             return None
         print_status(f"VoirAnime → embed: {embed_url[:70]}...", "info")
-        # Recurse with the embed URL (Sibnet, Vidmoly, etc.)
         return _process_single(embed_url)
 
-    # Vidmoly: prefer .biz domain (the original repo found this was more reliable)
+    # Vidmoly: prefer .biz domain (more reliable)
     if "vidmoly.to" in u or "vidmoly.net" in u:
         url = url.replace("vidmoly.to", "vidmoly.biz").replace("vidmoly.net", "vidmoly.biz")
         u = url.lower()
 
+    # OneUpload: normalize .to → .net
+    if "oneupload.to" in u:
+        url = url.replace("oneupload.to", "oneupload.net")
+        u = url.lower()
+
+    # --- Tier 1: Direct MP4 ---
     if "sendvid.com" in u:
         return extract_sendvid(url)
-    if "video.sibnet.ru" in u:
+    if "sibnet.ru" in u:
         return extract_sibnet(url)
+
+    # --- Tier 2: HLS M3U8 ---
     if "uqload" in u:
         return extract_uqload(url)
     if "vidmoly.biz" in u:
         return extract_vidmoly(url)
-    if "oneupload.net" in u or "oneupload.to" in u:
-        # normalize
-        url = url.replace("oneupload.to", "oneupload.net")
+    if "oneupload.net" in u:
         return extract_oneupload(url)
     if "embed4me" in u or "lpayer.embed4me" in u:
         return extract_embed4me(url)
+
+    # --- Tier 3: Packed-JS M3U8 ---
     if any(d in u for d in ("dingtezuni.com", "mivalyo.com",
                             "smoothpre.com", "movearnpre.com")):
         return extract_movearnpre_family(url)
+
+    # --- Tier 4: NEW v5.0 — Popular streaming hosts ---
+    if any(d in u for d in ("doodstream", "dood.so")):
+        return extract_doodstream(url)
+    if "streamtape" in u:
+        return extract_streamtape(url)
+    if any(d in u for d in ("mixdrop", "mixdrop.co", "mixdrop.to")):
+        return extract_mixdrop(url)
+    if "vidoza" in u:
+        return extract_vidoza(url)
+    if "streamlare" in u:
+        return extract_streamlare(url)
+    if any(d in u for d in ("upstream.to", "upstream")):
+        return extract_upstream(url)
+    if "filelions" in u:
+        return extract_filelions(url)
+    if "hubcloud" in u:
+        return extract_hubcloud(url)
+
+    # --- Last resort: try generic MP4 extraction ---
+    # This catches any host that embeds an MP4 URL in HTML/JS
+    print_debug(f"Source non reconnue, essai générique: {url[:80]}")
+    from .generic import extract_generic_mp4
+    result = extract_generic_mp4(url)
+    if result:
+        return result
 
     print_status(f"Source non supportée: {url}", "warning")
     return None
