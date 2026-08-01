@@ -1,12 +1,14 @@
 """Video downloader — single-episode and threaded multi-episode.
 
-v4.0 speed improvements:
-- Default max_segment_workers: 8 → 16 (parallel .ts segments)
-- Default max_workers: 5 → 8 (parallel episodes)
-- Larger chunk size for direct downloads (1MB → 4MB)
-- Connection pool reused across segments (HUGE speed gain)
-- Skip already-downloaded segments (resume)
-- Faster cleanup
+v4.2: Added fMP4 (CMAF) support.
+  - fMP4 playlists have an init segment (#EXT-X-MAP) that must be
+    written ONCE at the start of the output file, followed by all
+    the .m4s fragments in order. The output is a valid fragmented MP4.
+  - The .ts extension is kept for MPEG-TS playlists; .mp4 is used for
+    fMP4 playlists (so the converter knows not to force `-f mpegts`).
+  - Resume still works: a separate init manifest tracks whether the
+    init segment has been written.
+  - Parallel download + .parts dir + cleanup all preserved.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from tqdm import tqdm
 
 from src import network
 from src.config import get_config
-from src.converter import convert_ts_to_mp4
+from src.converter import convert_ts_to_mp4, convert_fmp4_to_mp4
 from src.ui import Colors, print_status, print_separator
 from src.utils import sanitize_filename
 
@@ -85,7 +87,10 @@ def download_episode(episode_num, url, video_source, anime_name, save_dir,
         return False, None
 
     # Conversion handling
-    if 'm3u8' in video_source and output_path and output_path.endswith('.ts'):
+    # The output_path's extension tells us what we have:
+    #   .ts  → MPEG-TS segments concatenated (use convert_ts_to_mp4)
+    #   .mp4 → fMP4 already assembled (init + m4s fragments) — already a valid MP4
+    if output_path and output_path.endswith('.ts'):
         if automatic_mp4:
             print_status("Conversion .ts → .mp4...", "loading")
             ok, final_path = convert_ts_to_mp4(output_path, final_mp4, tool=tool)
@@ -95,12 +100,7 @@ def download_episode(episode_num, url, video_source, anime_name, save_dir,
                 except OSError:
                     pass
                 print_status(f"Épisode {episode_num} → {final_path}", "success")
-                # Record in history
-                try:
-                    from src.history import record_download
-                    record_download(anime_name, episode_num, final_path)
-                except Exception:
-                    pass
+                _record_history(anime_name, episode_num, final_path)
                 return True, final_path
             else:
                 print_status(f"Conversion échouée — .ts conservé: {output_path}", "warning")
@@ -109,13 +109,38 @@ def download_episode(episode_num, url, video_source, anime_name, save_dir,
             print_status(f"Épisode {episode_num} → {output_path} (.ts)", "success")
             return True, output_path
     else:
-        print_status(f"Épisode {episode_num} → {output_path}", "success")
-        try:
-            from src.history import record_download
-            record_download(anime_name, episode_num, output_path)
-        except Exception:
-            pass
-        return True, output_path
+        # fMP4 already produces a valid .mp4 — but we may want to remux
+        # to optimize for streaming/compatibility. Use convert_fmp4_to_mp4
+        # which does NOT force `-f mpegts`.
+        if automatic_mp4 and output_path and output_path.endswith('.mp4') and output_path != final_mp4:
+            # Output is at output_path (e.g. episode_X.fmp4.mp4) — remux to final_mp4
+            print_status("Remux fMP4 → .mp4...", "loading")
+            ok, final_path = convert_fmp4_to_mp4(output_path, final_mp4, tool=tool)
+            if ok:
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+                print_status(f"Épisode {episode_num} → {final_path}", "success")
+                _record_history(anime_name, episode_num, final_path)
+                return True, final_path
+            else:
+                # The assembled fMP4 is already a valid MP4 — keep it as fallback
+                print_status(f"Remux échoué — fichier fMP4 conservé: {output_path}", "warning")
+                _record_history(anime_name, episode_num, output_path)
+                return True, output_path
+        else:
+            print_status(f"Épisode {episode_num} → {output_path}", "success")
+            _record_history(anime_name, episode_num, output_path)
+            return True, output_path
+
+
+def _record_history(anime_name: str, episode_num, path: str) -> None:
+    try:
+        from src.history import record_download
+        record_download(anime_name, episode_num, path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +184,6 @@ def download_video(video_url: str, save_path: str,
 # ---------------------------------------------------------------------------
 # Direct download (MP4) — speed-optimized
 # ---------------------------------------------------------------------------
-# 4MB chunks for maximum throughput on stable connections
 _DIRECT_CHUNK_SIZE = 4 * 1024 * 1024
 
 
@@ -202,59 +226,115 @@ def _download_direct(video_url: str, save_path: str,
 
 
 # ---------------------------------------------------------------------------
-# M3U8 download (segment-by-segment, with resume)
+# M3U8 download (segment-by-segment, with resume + fMP4 support)
 # ---------------------------------------------------------------------------
 def _download_m3u8(m3u8_url: str, save_path: str,
                    headers: dict,
                    use_threads: bool) -> Tuple[bool, Optional[str]]:
-    from src.extractors.common import extract_segments
+    from src.extractors.common import extract_segments, PlaylistInfo
 
-    segments = extract_segments(m3u8_url)
-    if not segments:
+    playlist = extract_segments(m3u8_url)
+    if not playlist or not playlist.segments:
         return False, None
 
+    init_url = playlist.init_segment
+    segments = playlist.segments
+    is_fmp4 = playlist.is_fmp4
+
     os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
-    ts_path = save_path.replace('.mp4', '.ts')
+
+    # Choose output extension based on format
+    # - fMP4 → .mp4 (the assembled file is already a valid MP4)
+    # - MPEG-TS → .ts (needs conversion to .mp4 afterwards)
+    if is_fmp4:
+        # Use a distinct intermediate name so we know it's the fMP4-assembled file
+        out_path = save_path.replace('.mp4', '.fmp4.mp4')
+    else:
+        out_path = save_path.replace('.mp4', '.ts')
 
     # Resume logic via manifest
-    manifest_path = ts_path + '.manifest'
+    manifest_path = out_path + '.manifest'
+    init_manifest_path = out_path + '.init_manifest'
     done_segments = _load_manifest(manifest_path)
+    init_done = os.path.exists(init_manifest_path) and os.path.getsize(init_manifest_path) > 0
 
-    if done_segments and len(done_segments) == len(segments):
-        print_status("Segments déjà téléchargés — assemblage...", "info")
-        # Check if .parts dir exists (threaded) or .ts already assembled
-        partial_dir = ts_path + '.parts'
-        if os.path.isdir(partial_dir):
-            if _assemble_from_parts(partial_dir, segments, ts_path, len(segments)):
-                try:
-                    os.remove(manifest_path)
-                except OSError:
-                    pass
-                return True, ts_path
-        if os.path.exists(ts_path):
+    # For fMP4: also need to check if init segment was downloaded
+    if is_fmp4 and init_url:
+        # If the assembled file already exists and init was done, we're good
+        if (done_segments and len(done_segments) == len(segments) and init_done
+                and os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+            print_status("Playlist déjà assemblée — skip", "info")
             try:
                 os.remove(manifest_path)
+                os.remove(init_manifest_path)
             except OSError:
                 pass
-            return True, ts_path
+            return True, out_path
+
+        # Download init segment first (only once)
+        if not init_done:
+            print_status("Téléchargement du segment d'initialisation fMP4...", "info")
+            init_data = _fetch_segment(init_url, headers, -1)
+            if init_data is None:
+                print_status("Échec téléchargement init segment", "error")
+                return False, None
+            # Write init to a dedicated file (we'll prepend it during assembly)
+            init_file = out_path + '.init'
+            try:
+                with open(init_file, 'wb') as f:
+                    f.write(init_data)
+                # Mark init as done
+                with open(init_manifest_path, 'w') as f:
+                    f.write("1\n")
+            except Exception as e:
+                print_status(f"Écriture init échouée: {e}", "error")
+                return False, None
+
+    # Check if all segments are already done
+    if done_segments and len(done_segments) == len(segments):
+        print_status("Segments déjà téléchargés — assemblage...", "info")
+        partial_dir = out_path + '.parts'
+        if os.path.isdir(partial_dir):
+            if _assemble_from_parts(partial_dir, segments, out_path, len(segments),
+                                    is_fmp4=is_fmp4, init_path=(out_path + '.init') if is_fmp4 else None):
+                try:
+                    os.remove(manifest_path)
+                    if is_fmp4:
+                        os.remove(init_manifest_path)
+                        # Remove the .init file (now embedded in the output)
+                        init_file = out_path + '.init'
+                        if os.path.exists(init_file):
+                            os.remove(init_file)
+                except OSError:
+                    pass
+                return True, out_path
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            try:
+                os.remove(manifest_path)
+                if is_fmp4:
+                    os.remove(init_manifest_path)
+            except OSError:
+                pass
+            return True, out_path
 
     cfg = get_config()
-    # v4.0: default to threaded mode unless explicitly disabled
-    # (use_threads comes from --fast flag or interactive choice)
     max_workers = cfg.max_segment_workers if use_threads else 1
 
-    # Even in "non-threaded" mode, we still benefit from connection pooling
-    print_status(f"{len(segments)} segments — workers={max_workers}", "info")
+    fmt_label = "fMP4" if is_fmp4 else "MPEG-TS"
+    print_status(
+        f"{fmt_label}: {len(segments)} segments — workers={max_workers}",
+        "info",
+    )
 
     if max_workers > 1:
         ok = _download_segments_threaded(
-            segments, ts_path, headers, max_workers,
+            segments, out_path, headers, max_workers,
             done_indices=done_segments,
             manifest_path=manifest_path,
         )
     else:
         ok = _download_segments_sequential(
-            segments, ts_path, headers,
+            segments, out_path, headers,
             done_indices=done_segments,
             manifest_path=manifest_path,
         )
@@ -264,11 +344,16 @@ def _download_m3u8(m3u8_url: str, save_path: str,
 
     try:
         os.remove(manifest_path)
+        if is_fmp4:
+            os.remove(init_manifest_path)
+            init_file = out_path + '.init'
+            if os.path.exists(init_file):
+                os.remove(init_file)
     except OSError:
         pass
 
-    print_status(f"Assemblé → {ts_path}", "success")
-    return True, ts_path
+    print_status(f"Assemblé → {out_path}", "success")
+    return True, out_path
 
 
 def _load_manifest(path: str) -> set:
@@ -289,11 +374,14 @@ def _append_manifest(path: str, index: int) -> None:
         pass
 
 
-def _download_segments_sequential(segments: List[str], ts_path: str,
+def _download_segments_sequential(segments: List[str], out_path: str,
                                   headers: dict,
                                   done_indices: set,
                                   manifest_path: str) -> bool:
-    partial = ts_path + '.partial'
+    """Sequential download. For fMP4, the init segment is prepended during
+    assembly (NOT here) so we don't write it multiple times on resume.
+    """
+    partial = out_path + '.partial'
     if os.path.exists(partial) and not done_indices:
         try:
             os.remove(partial)
@@ -304,7 +392,7 @@ def _download_segments_sequential(segments: List[str], ts_path: str,
     try:
         with open(partial, mode) as f:
             with tqdm(total=len(segments), initial=len(done_indices),
-                      desc=f"📥 {os.path.basename(ts_path)}",
+                      desc=f"📥 {os.path.basename(out_path)}",
                       unit="seg") as pbar:
                 for i, seg_url in enumerate(segments):
                     if i in done_indices:
@@ -316,7 +404,7 @@ def _download_segments_sequential(segments: List[str], ts_path: str,
                     f.flush()
                     _append_manifest(manifest_path, i)
                     pbar.update(1)
-        os.rename(partial, ts_path)
+        os.rename(partial, out_path)
         return True
     except KeyboardInterrupt:
         print_status("\nInterrompu — segments conservés pour reprise", "warning")
@@ -326,41 +414,38 @@ def _download_segments_sequential(segments: List[str], ts_path: str,
         return False
 
 
-def _download_segments_threaded(segments: List[str], ts_path: str,
+def _download_segments_threaded(segments: List[str], out_path: str,
                                 headers: dict, max_workers: int,
                                 done_indices: set,
                                 manifest_path: str) -> bool:
     """Download segments in parallel using the SHARED session.
 
-    v4.0: uses the shared network session (one big connection pool)
-    instead of per-thread sessions. This dramatically speeds up
-    downloads because connections are reused.
+    For fMP4, the init segment is downloaded separately in _download_m3u8
+    and stored in out_path + '.init'. It is prepended ONLY during the
+    final assembly (_assemble_from_parts), NEVER during segment download.
+    This guarantees init is written exactly once.
     """
-    partial_dir = ts_path + '.parts'
+    partial_dir = out_path + '.parts'
     os.makedirs(partial_dir, exist_ok=True)
 
     # Determine which segments actually need to be downloaded.
-    # A segment is "truly done" only if its .part file exists.
-    # If the manifest says done but the .part is missing (e.g. cleaned up
-    # after a previous successful assembly), we need to re-download.
     truly_pending = []
     for i in range(len(segments)):
         if i in done_indices:
             part_file = os.path.join(partial_dir, f"{i:08d}.part")
             if os.path.exists(part_file):
-                continue  # truly done
+                continue
         truly_pending.append(i)
 
     if not truly_pending:
-        # All segments already have their .part files
-        return _assemble_from_parts(partial_dir, segments, ts_path, len(segments))
+        return _assemble_from_parts(partial_dir, segments, out_path, len(segments))
 
     print_status(f"Téléchargement parallèle ({len(truly_pending)} segments, {max_workers} workers)", "info")
 
     failed = False
     try:
         with tqdm(total=len(segments), initial=len(segments) - len(truly_pending),
-                  desc=f"📥 {os.path.basename(ts_path)}",
+                  desc=f"📥 {os.path.basename(out_path)}",
                   unit="seg") as pbar:
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futures = {
@@ -389,7 +474,7 @@ def _download_segments_threaded(segments: List[str], ts_path: str,
     if failed:
         return False
 
-    return _assemble_from_parts(partial_dir, segments, ts_path, len(segments))
+    return _assemble_from_parts(partial_dir, segments, out_path, len(segments))
 
 
 def _fetch_segment(seg_url: str, headers: dict, index: int) -> Optional[bytes]:
@@ -426,10 +511,29 @@ def _fetch_segment_to_file(seg_url: str, headers: dict, index: int,
 
 
 def _assemble_from_parts(partial_dir: str, segments: List[str],
-                         ts_path: str, count: int) -> bool:
+                         out_path: str, count: int,
+                         is_fmp4: bool = False,
+                         init_path: Optional[str] = None) -> bool:
+    """Assemble .part files into the final output.
+
+    For fMP4 (is_fmp4=True):
+      - If init_path exists, write it FIRST (the initialization segment
+        containing the 'moov' / 'moof' header boxes).
+      - Then concatenate all .m4s fragments in order.
+      - The result is a valid fragmented MP4 (CMAF).
+
+    For MPEG-TS (is_fmp4=False):
+      - Just concatenate the segments in order (same as before).
+    """
     print_status("Assemblage des segments...", "loading")
     try:
-        with open(ts_path, 'wb') as out:
+        with open(out_path, 'wb') as out:
+            # For fMP4: write the init segment exactly once at the start
+            if is_fmp4 and init_path and os.path.exists(init_path):
+                with open(init_path, 'rb') as f:
+                    out.write(f.read())
+                print_debug_init_written()
+
             for i in range(count):
                 part = os.path.join(partial_dir, f"{i:08d}.part")
                 if not os.path.exists(part):
@@ -451,16 +555,24 @@ def _assemble_from_parts(partial_dir: str, segments: List[str],
 
 
 def _cleanup_partial(*paths: str) -> None:
+    """Clean up all intermediate files for the given base paths."""
     for p in paths:
         if not p:
             continue
-        for suffix in ('', '.partial', '.manifest'):
+        for suffix in ('', '.partial', '.manifest', '.init_manifest', '.init', '.fmp4.mp4'):
             f = p + suffix
             if os.path.exists(f):
                 try:
                     os.remove(f)
                 except OSError:
                     pass
+        # Also clean .fmp4.mp4 variants
+        fmp4_path = p.replace('.ts', '.fmp4.mp4')
+        if os.path.exists(fmp4_path):
+            try:
+                os.remove(fmp4_path)
+            except OSError:
+                pass
         parts_dir = p + '.parts'
         if os.path.isdir(parts_dir):
             try:
@@ -469,3 +581,9 @@ def _cleanup_partial(*paths: str) -> None:
                 os.rmdir(parts_dir)
             except OSError:
                 pass
+
+
+# Inline helper to keep _assemble_from_parts readable
+def print_debug_init_written() -> None:
+    from src.ui import print_debug
+    print_debug("Init segment written (fMP4)")

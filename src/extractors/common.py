@@ -1,12 +1,22 @@
-"""Common helpers shared across extractors:
-- packed-JS unpacker (single implementation, replaces the two divergent ones)
-- master.m3u8 URL extraction
-- best-variant m3u8 selection
+"""Common helpers shared across extractors.
+
+v4.2: Added fMP4 (CMAF) support — detects #EXT-X-MAP and returns the
+init segment URL alongside the media segments. This is required for
+hosts (Vidmoly, etc.) that switched from MPEG-TS segments to fMP4.
+
+Public API:
+  - extract_segments(playlist_url) -> PlaylistInfo | None
+    Where PlaylistInfo = (init_segment_url | None, [segment_urls], is_fmp4)
+
+  Old callers that did `segments = extract_segments(url)` and then
+  `len(segments)` will still work because PlaylistInfo is a NamedTuple
+  that supports __len__ and __iter__ on its segments field for backward
+  compatibility — but you should destructure it for new code.
 """
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from src import network
@@ -14,6 +24,36 @@ from src.ui import print_debug, print_status
 
 
 ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+# ---------------------------------------------------------------------------
+# Playlist info — returned by extract_segments
+# ---------------------------------------------------------------------------
+class PlaylistInfo(NamedTuple):
+    """Information about an HLS media playlist.
+
+    Attributes:
+        init_segment: URL of the initialization segment (fMP4 only).
+                      None for plain MPEG-TS playlists.
+        segments: List of media segment URLs (in order).
+        is_fmp4: True if this is a fragmented MP4 (CMAF) playlist.
+                 False for MPEG-TS.
+    """
+    init_segment: Optional[str]
+    segments: List[str]
+    is_fmp4: bool
+
+    # Backward-compat: allow `len(playlist)` and `for url in playlist`
+    # so old code that treated the return value as a list of URLs keeps
+    # working (it iterates over segments, ignoring init).
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def __iter__(self):
+        return iter(self.segments)
+
+    def __bool__(self) -> bool:
+        return bool(self.segments)
 
 
 # ---------------------------------------------------------------------------
@@ -56,16 +96,11 @@ def extract_packed_code(html: str) -> Optional[Tuple[str, int, int, List[str]]]:
 def unpack_js(packed: str, base: int, count: int, words: List[str]) -> str:
     """Unpack a packed-JS payload.
 
-    Correctness note: we iterate in REVERSED order so that longer tokens
-    (higher indices) are replaced first, preventing partial collisions
-    with shorter tokens that share a prefix. The two original
-    implementations disagreed on this; reversed is correct because
-    tokens are word-boundary anchored but `re.sub` does left-to-right
-    replacement which is order-sensitive when one token is a prefix of
-    another in the alphabet (e.g. base 36: 'a' is 10, 'aa' is 370).
+    We iterate in REVERSED order so that longer tokens (higher indices)
+    are replaced first, preventing partial collisions with shorter tokens
+    that share a prefix.
     """
     out = packed
-    # Replace longest tokens first to avoid prefix collisions
     for i in sorted(range(min(count, len(words))), reverse=True):
         word = words[i]
         if not word:
@@ -82,7 +117,6 @@ def unpack_js(packed: str, base: int, count: int, words: List[str]) -> str:
 # ---------------------------------------------------------------------------
 def find_m3u8_in_code(code: str) -> Optional[str]:
     """Find an m3u8 URL (absolute or /stream/...) inside unpacked JS."""
-    # Try absolute URLs first
     for p in (
         r'https?://[^"\']+master\.m3u8[^"\']*',
         r'https?://[^"\']+\.m3u8[^"\']*',
@@ -90,7 +124,6 @@ def find_m3u8_in_code(code: str) -> Optional[str]:
         m = re.search(p, code)
         if m:
             return m.group(0)
-    # Try relative /stream/.../master.m3u8
     m = re.search(r'["\'](/stream/[^"\']*/master\.m3u8[^"\']*)["\']', code)
     if m:
         return m.group(1)
@@ -119,7 +152,6 @@ def select_best_variant(master_url: str) -> Optional[str]:
         if line.startswith("#EXT-X-STREAM-INF"):
             bw_m = re.search(r'BANDWIDTH=(\d+)', line)
             bw = int(bw_m.group(1)) if bw_m else 0
-            # The next non-comment line is the variant URL
             for j in range(i + 1, len(lines)):
                 next_line = lines[j].strip()
                 if not next_line:
@@ -138,11 +170,42 @@ def select_best_variant(master_url: str) -> Optional[str]:
     return best_url
 
 
-def extract_segments(playlist_url: str) -> Optional[List[str]]:
-    """Fetch an m3u8 playlist and return the list of segment URLs.
+# ---------------------------------------------------------------------------
+# Regex for #EXT-X-MAP — the init segment declaration in fMP4 playlists
+# ---------------------------------------------------------------------------
+# Format example:
+#   #EXT-X-MAP:URI="init.mp4"            (relative)
+#   #EXT-X-MAP:URI="https://cdn/init.mp4"  (absolute)
+#   #EXT-X-MAP:URI="init.mp4",BYTERANGE="1234@0"
+_EXT_X_MAP_RE = re.compile(
+    r'#EXT-X-MAP:.*?URI="([^"]+)"',
+    re.IGNORECASE,
+)
 
-    Handles master playlists (picks best variant) and media playlists
-    (returns segment URLs directly).
+
+def _parse_ext_x_map(line: str, base_url: str) -> Optional[str]:
+    """Parse an #EXT-X-MAP line and return the absolute init segment URL."""
+    m = _EXT_X_MAP_RE.search(line)
+    if not m:
+        return None
+    uri = m.group(1)
+    if not uri:
+        return None
+    if not uri.startswith("http"):
+        uri = urljoin(base_url, uri)
+    return uri
+
+
+def extract_segments(playlist_url: str) -> Optional[PlaylistInfo]:
+    """Fetch an m3u8 playlist and return PlaylistInfo.
+
+    Handles:
+      - Master playlists (recurses into best variant)
+      - MPEG-TS media playlists (returns segments only, is_fmp4=False)
+      - fMP4 / CMAF playlists (returns init_segment + segments, is_fmp4=True)
+
+    Returns None on fetch failure. Returns PlaylistInfo with empty segments
+    list if no segments are found.
     """
     try:
         text = network.get_text(playlist_url, timeout=15)
@@ -157,20 +220,54 @@ def extract_segments(playlist_url: str) -> Optional[List[str]]:
             return extract_segments(best)
         return None
 
-    segments: List[str] = []
     base = playlist_url
+    init_segment: Optional[str] = None
+    is_fmp4 = False
+    segments: List[str] = []
+
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
+
+        # Comment line — but check for #EXT-X-MAP first
+        if line.startswith("#"):
+            if line.upper().startswith("#EXT-X-MAP"):
+                init_url = _parse_ext_x_map(line, base)
+                if init_url:
+                    init_segment = init_url
+                    is_fmp4 = True
+            continue
+
+        # Media segment URL
         if not line.startswith("http"):
             line = urljoin(base, line)
         segments.append(line)
 
     if not segments:
-        print_status("Aucun segment .ts trouvé dans la playlist", "warning")
+        print_status("Aucun segment trouvé dans la playlist", "warning")
         return None
-    return segments
+
+    if is_fmp4:
+        print_status(
+            f"Playlist fMP4 détectée — init: {os.path.basename(init_segment or '?')}, "
+            f"{len(segments)} segments",
+            "info",
+        )
+    else:
+        print_debug(f"MPEG-TS playlist — {len(segments)} segments")
+
+    return PlaylistInfo(
+        init_segment=init_segment,
+        segments=segments,
+        is_fmp4=is_fmp4,
+    )
+
+
+# Allow `import os` for the basename call in the fMP4 branch above without
+# polluting the top of the file (kept at the bottom intentionally so the
+# critical HLS code reads cleanly up top).
+import os  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +282,6 @@ def fetch_and_unpack(embed_url: str, referer: Optional[str] = None) -> Optional[
     if referer:
         headers["Referer"] = referer
     else:
-        # Use the embed site root as referer
         try:
             parsed = urlparse(embed_url)
             headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"

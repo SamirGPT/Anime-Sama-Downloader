@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anime-sama-downloader"
-version = "4.1.1"
-description = "Téléchargeur robuste + chatbot IA (Groq/Qwen3 via requests) pour anime-sama.to + voiranime.rip — Termux/Ubuntu edition"
+version = "4.2.0"
+description = "Téléchargeur robuste + chatbot IA (Groq/Qwen3 via requests) pour anime-sama.to + voiranime.rip — support HLS fMP4 + MPEG-TS — Termux/Ubuntu edition"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "GPL-3.0" }

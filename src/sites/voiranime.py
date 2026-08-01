@@ -1,21 +1,29 @@
 """voiranime.rip site implementation.
 
-Voiranime is a WordPress-based anime streaming site. Its structure:
-- Home: https://voiranime.rip/
-- Search: https://voiranime.rip/?s={query}
-- Anime page: https://voiranime.rip/anime/{slug}/
-- Episode: https://voiranime.rip/{slug}-saison-{n}-episode-{n}/
-           or https://voiranime.rip/episode/{slug}/
+Reverse-engineered from the actual site (v4.2 — previously the
+implementation was based on guesses and did not work).
 
-The site typically embeds the same video players as anime-sama
-(Sibnet, Vidmoly, SendVid, etc.), so we can reuse the extractors.
+Actual site structure (verified by scraping the live site):
+  - Home:        https://voiranime.rip/
+  - Search:      https://voiranime.rip/search?q={query}    (NOT ?s=)
+  - Anime page:  https://voiranime.rip/{slug}/             (e.g. /naruto-shippuden/)
+  - Season page: https://voiranime.rip/{slug}/saison-{n}/  (e.g. /naruto-shippuden/saison-1/)
+  - Episode:     https://voiranime.rip/{slug}/saison-{n}/episode-{m}/
 
-Note: web structures change. If voiranime.rip updates its layout,
-the regexes here may need adjustment. The framework makes it easy
-to refine without touching the rest of the code.
+Episode pages contain an <iframe id="videoPlayer" src="..."> and a
+JS dict `videoUrls = {"vf": "...", "vostfr": "..."}` listing the
+available language versions of the embed URL. The embed URL itself
+points to a player (Sibnet, Vidmoly, Uqload, etc.) which we then
+pass to the standard extractors.
+
+URL validation:
+  - https://voiranime.rip/{slug}/saison-{n}/              ← season page (valid)
+  - https://voiranime.rip/{slug}/saison-{n}/episode-{m}/  ← episode page (valid)
+  - https://voiranime.rip/{slug}/                         ← anime page (needs expand)
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, quote
@@ -31,9 +39,25 @@ from src.utils import sanitize_filename
 DOMAIN = "voiranime.rip"
 BASE_URL = f"https://{DOMAIN}"
 
+# Episode URL pattern: /{slug}/saison-N/episode-M/
+_EP_URL_RE = re.compile(
+    rf'^https?://(?:www\.)?{re.escape(DOMAIN)}/[^/]+/saison-\d+/episode-\d+/?$',
+    re.IGNORECASE,
+)
+# Season URL pattern: /{slug}/saison-N/
+_SEASON_URL_RE = re.compile(
+    rf'^https?://(?:www\.)?{re.escape(DOMAIN)}/[^/]+/saison-\d+/?$',
+    re.IGNORECASE,
+)
+# Anime URL pattern: /{slug}/
+_ANIME_URL_RE = re.compile(
+    rf'^https?://(?:www\.)?{re.escape(DOMAIN)}/[^/]+/?$',
+    re.IGNORECASE,
+)
+
 
 class VoirAnimeSite:
-    """voiranime.rip site — uses WordPress patterns."""
+    """voiranime.rip site — custom (non-WordPress) structure."""
 
     key = "voiranime"
     display = "VoirAnime"
@@ -53,8 +77,7 @@ class VoirAnimeSite:
     # Cloudflare / headers
     # ------------------------------------------------------------------
     def setup_cloudflare(self) -> bool:
-        # Voiranime typically doesn't use Cloudflare protection as aggressively
-        # as anime-sama. Just probe to confirm reachability.
+        """Voiranime is reachable without Cloudflare cookies in most cases."""
         try:
             r = network.get(f"{BASE_URL}/", timeout=10)
             if r.status_code == 200:
@@ -62,8 +85,7 @@ class VoirAnimeSite:
                 return True
             if r.status_code in (403, 503):
                 print_status(
-                    "VoirAnime bloqué (peut-être Cloudflare). "
-                    "Réessaie plus tard ou utilise un VPN.",
+                    "VoirAnime bloqué (Cloudflare?). Réessaie plus tard ou utilise un VPN.",
                     "warning",
                 )
                 return False
@@ -85,11 +107,11 @@ class VoirAnimeSite:
     # Search
     # ------------------------------------------------------------------
     def search(self, query: str, headers: Optional[Dict] = None) -> List[Dict[str, str]]:
-        """Search voiranime.rip via the WordPress ?s= parameter."""
+        """Search via /search?q=... and parse the results."""
         if not query.strip():
             return []
         headers = headers or self.get_headers()
-        search_url = f"{BASE_URL}/?s={quote(query)}"
+        search_url = f"{BASE_URL}/search?q={quote(query)}"
         try:
             r = network.get(search_url, headers=headers, timeout=15)
             if r.status_code != 200:
@@ -104,39 +126,59 @@ class VoirAnimeSite:
         results: List[Dict[str, str]] = []
         seen = set()
 
-        # WordPress search results typically use <article> or <div class="post">
-        # Try multiple selectors
-        for selector in [
-            ("article", {}),
-            ("div", {"class": re.compile(r"post|item|result|article", re.I)}),
-            ("li", {"class": re.compile(r"post|item|result", re.I)}),
-            ("h2", {"class": re.compile(r"entry-title|title", re.I)}),
-            ("h3", {"class": re.compile(r"entry-title|title", re.I)}),
-        ]:
-            tag, attrs = selector
-            for el in soup.find_all(tag, attrs):
-                a = el.find("a", href=True) if el.name != "a" else el
-                if not a or not a.get("href"):
-                    continue
-                href = a["href"]
-                title = a.get_text(strip=True)
-                if not title or href in seen:
-                    continue
-                # Filter out non-anime links
-                if "/anime/" in href or "/episode/" in href or "/category/" in href:
-                    seen.add(href)
-                    results.append({
-                        "title": title,
-                        "url": href,
-                        "support": "Anime Supported",
-                    })
-            if results:
+        # Result cards link to anime pages like /{slug}/
+        # We look for <a href="/slug/"> where slug is not a known section
+        known_sections = {
+            "", "anime", "film", "catalogue", "search", "tags",
+            "aide", "dmca", "img", "js", "css", "api",
+            "planning", "profil", "login", "register", "user",
+            "search.php", "compte", "connexion", "inscription",
+        }
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            title = a.get_text(strip=True)
+            if not title or href in seen:
+                continue
+            # Normalize to absolute
+            full = urljoin(f"{BASE_URL}/", href)
+            # Must be on voiranime.rip
+            if not self.matches(full):
+                continue
+            # Extract the path
+            try:
+                from urllib.parse import urlparse
+                path = urlparse(full).path.strip("/")
+            except Exception:
+                continue
+            if not path:
+                continue
+            # First segment must not be a known section
+            first_seg = path.split("/")[0].lower()
+            # Also skip if it ends with .php (search.php, etc.)
+            if first_seg.endswith(".php"):
+                continue
+            if first_seg in known_sections:
+                continue
+            # Must be an anime page (single segment, no season/episode)
+            if "/" in path:
+                continue
+            # Skip very short titles (likely nav buttons)
+            if len(title) < 2:
+                continue
+            seen.add(full)
+            results.append({
+                "title": title,
+                "url": full,
+                "support": "Anime Supported",
+            })
+            if len(results) >= 30:
                 break
 
         return results
 
     # ------------------------------------------------------------------
-    # Expand (find seasons/episodes from anime page)
+    # Expand (find seasons from anime page)
     # ------------------------------------------------------------------
     def expand(self, url: str, headers: Optional[Dict] = None) -> List[Dict[str, str]]:
         """From an anime page, list its seasons."""
@@ -153,41 +195,75 @@ class VoirAnimeSite:
         results: List[Dict[str, str]] = []
         seen = set()
 
-        # Look for season links — common patterns
-        # 1. <a href=".../saison-1/"> or <a href=".../season-1/">
-        # 2. <a href=".../category/.../saison-...">
+        # Look for /{slug}/saison-N/ links
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            text = a.get_text(strip=True)
-            if not text or href in seen:
+            if href in seen:
                 continue
-            # Match season-like URLs
-            if re.search(r'/saison[-_]?\d|/season[-_]?\d', href, re.I):
-                seen.add(href)
-                results.append({"name": text, "url": href})
-            elif "/category/" in href and href != url:
-                seen.add(href)
-                results.append({"name": text, "url": href})
+            full = urljoin(url, href)
+            # Must be a season URL (not just any link on the page)
+            if "/saison-" not in full.lower():
+                continue
+            if not _SEASON_URL_RE.match(full):
+                continue
+            seen.add(full)
+            # Clean up the name: remove "Anime" prefix if present, trim
+            raw_text = a.get_text(strip=True)
+            name = self._clean_season_name(raw_text, full)
+            results.append({"name": name, "url": full})
 
-        # Dedupe and keep order
-        return results
+        # Dedupe by URL (keep order)
+        unique: List[Dict[str, str]] = []
+        seen_urls = set()
+        for r in results:
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                unique.append(r)
+        return unique
 
-    def validate(self, url: str) -> bool:
-        """A valid VoirAnime URL is one that contains /episode/ or /saison/ or /season/."""
-        if not self.matches(url):
-            return False
-        u = url.lower()
-        return any(k in u for k in ("/episode", "/saison", "/season", "/category/"))
+    @staticmethod
+    def _clean_season_name(raw: str, url: str) -> str:
+        """Clean up a season name extracted from the page.
+
+        Voiranime often concatenates the anime title + 'Saison N' + time
+        (e.g. 'AnimeFarming Life in Another WorldSaison 216:30').
+        We extract a clean 'Saison N' name from the URL as fallback.
+        """
+        if not raw:
+            return VoirAnimeSite._extract_season_name(url)
+        # Try to extract season number from URL for a clean name
+        m = re.search(r'/saison-(\d+)/?', url, re.IGNORECASE)
+        if m:
+            return f"Saison {m.group(1)}"
+        return raw[:80]  # truncate if too long
+
+    @staticmethod
+    def _extract_season_name(url: str) -> str:
+        m = re.search(r'/saison-(\d+)/?', url, re.IGNORECASE)
+        if m:
+            return f"Saison {m.group(1)}"
+        return "Saison"
 
     # ------------------------------------------------------------------
-    # Episodes — find all episode URLs on a season page
+    # Validate URL
+    # ------------------------------------------------------------------
+    def validate(self, url: str) -> bool:
+        """A valid URL is a season page or an episode page."""
+        if not self.matches(url):
+            return False
+        return bool(_SEASON_URL_RE.match(url) or _EP_URL_RE.match(url))
+
+    # ------------------------------------------------------------------
+    # Episodes — scrape episode URLs from a season page
     # ------------------------------------------------------------------
     def fetch_episodes(self, url: str,
                        headers: Optional[Dict] = None) -> Optional[Dict[str, List[str]]]:
-        """Scrape episode URLs from a season/category page.
+        """Scrape episode URLs from a season page.
 
-        Returns {"Player 1": [url1, url2, ...]} — single player since
-        VoirAnime usually has one embed per episode.
+        Returns {"Player 1": [url1, url2, ...]}.
+        The actual embed URLs are resolved per-episode at download time
+        by fetch_video_source (which calls the right extractor based on
+        the iframe src found on the episode page).
         """
         headers = headers or self.get_headers()
         try:
@@ -197,63 +273,110 @@ class VoirAnimeSite:
                 return None
             html = r.text
         except Exception as e:
-            print_status(f"Erreur fetch page: {e}", "error")
+            print_status(f"Erreur fetch page saison: {e}", "error")
             return None
 
         soup = BeautifulSoup(html, "html.parser")
         episode_urls: List[str] = []
         seen = set()
 
-        # Find episode links
+        # Find all /{slug}/saison-N/episode-M/ links
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href in seen:
                 continue
-            # Match episode URL patterns
-            if re.search(r'/episode/|[-_]episode[-_]?\d', href, re.I):
-                # Make absolute
-                if not href.startswith("http"):
-                    href = urljoin(url, href)
-                seen.add(href)
-                episode_urls.append(href)
-
-        if not episode_urls:
-            # Fallback: try pagination — get all episodes by following page links
-            print_status("Aucun épisode direct — essai pagination...", "info")
-            # Try /page/2/, /page/3/, etc.
-            for page in range(2, 10):
-                page_url = url.rstrip("/") + f"/page/{page}/"
-                try:
-                    pr = network.get(page_url, headers=headers, timeout=10)
-                    if pr.status_code != 200:
-                        break
-                    psoup = BeautifulSoup(pr.text, "html.parser")
-                    found_any = False
-                    for a in psoup.find_all("a", href=True):
-                        href = a["href"]
-                        if re.search(r'/episode/|[-_]episode[-_]?\d', href, re.I):
-                            if href not in seen:
-                                if not href.startswith("http"):
-                                    href = urljoin(page_url, href)
-                                seen.add(href)
-                                episode_urls.append(href)
-                                found_any = True
-                    if not found_any:
-                        break
-                except Exception:
-                    break
+            full = urljoin(url, href)
+            if _EP_URL_RE.match(full):
+                seen.add(full)
+                episode_urls.append(full)
 
         if not episode_urls:
             print_status("Aucun épisode trouvé sur VoirAnime", "warning")
             return {}
 
-        # Reverse to get episode 1 first (WordPress lists newest first)
-        episode_urls.reverse()
+        # Sort by episode number (the URLs contain "episode-N")
+        def _ep_num(u: str) -> int:
+            m = re.search(r'/episode-(\d+)/?', u, re.IGNORECASE)
+            return int(m.group(1)) if m else 0
+        episode_urls.sort(key=_ep_num)
+
         print_status(f"VoirAnime: {len(episode_urls)} épisodes trouvés", "success")
         return {"Player 1": episode_urls}
 
     # ------------------------------------------------------------------
-    # Scans — VoirAnime doesn't typically host scans
+    # Custom: extract the video embed URL from an episode page.
+    # This is called by fetch_video_source via the dispatch in
+    # src/extractors/__init__.py (see the voiranime case added there).
+    # ------------------------------------------------------------------
+    def extract_episode_video(self, episode_url: str,
+                              headers: Optional[Dict] = None) -> Optional[str]:
+        """Extract the embed URL (Sibnet/Vidmoly/etc.) from a VoirAnime episode page.
+
+        The page contains:
+          <iframe id="videoPlayer" src="https://video.sibnet.ru/shell.php?videoid=XXX">
+        and a JS dict:
+          const videoUrls = {"vf":"...", "vostfr":"..."};
+
+        We try the iframe src first (most reliable), then fall back to
+        parsing videoUrls.
+        """
+        headers = headers or self.get_headers()
+        try:
+            r = network.get(episode_url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                return None
+            html = r.text
+        except Exception:
+            return None
+
+        # 1. Try iframe with id=videoPlayer
+        soup = BeautifulSoup(html, "html.parser")
+        iframe = soup.find("iframe", id="videoPlayer") or soup.find("iframe", src=True)
+        if iframe and iframe.get("src"):
+            return iframe["src"]
+
+        # 2. Fallback: parse the videoUrls JS dict
+        # Pattern: videoUrls = {"vf":"URL","vostfr":"URL"};
+        m = re.search(
+            r'videoUrls\s*=\s*(\{[^}]+\})',
+            html,
+        )
+        if m:
+            try:
+                # JS dict → JSON (replace single quotes, etc.)
+                dict_str = m.group(1)
+                # Remove trailing semicolons/commas
+                dict_str = dict_str.strip().rstrip(';').rstrip(',')
+                # Try to parse as JSON (it usually is valid JSON)
+                try:
+                    data = json.loads(dict_str)
+                except json.JSONDecodeError:
+                    # Fall back to regex extraction of URLs
+                    urls = re.findall(r':\s*"(https?://[^"]+)"', dict_str)
+                    if urls:
+                        return urls[0]
+                else:
+                    # Prefer vostfr, then vf, then first available
+                    for key in ("vostfr", "vf", "vo"):
+                        if key in data and data[key]:
+                            return data[key]
+                    if data:
+                        first_val = next(iter(data.values()))
+                        if first_val:
+                            return first_val
+            except Exception:
+                pass
+
+        # 3. Last resort: any iframe src in the page
+        for iframe in soup.find_all("iframe", src=True):
+            src = iframe["src"]
+            if src.startswith("http"):
+                return src
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Scans — VoirAnime doesn't host scans
     # ------------------------------------------------------------------
     def is_scan_url(self, url: str) -> bool:
         return False

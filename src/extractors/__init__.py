@@ -27,6 +27,17 @@ def _process_single(url: str) -> Optional[str]:
 
     u = url.lower()
 
+    # VoirAnime: episode page → extract the embed URL first, then recurse
+    if "voiranime.rip" in u or "voiranime.com" in u or "voiranime.fr" in u:
+        from src.sites.voiranime import SITE as VA_SITE
+        embed_url = VA_SITE.extract_episode_video(url)
+        if not embed_url:
+            print_status("VoirAnime: aucune source vidéo trouvée sur la page", "warning")
+            return None
+        print_status(f"VoirAnime → embed: {embed_url[:70]}...", "info")
+        # Recurse with the embed URL (Sibnet, Vidmoly, etc.)
+        return _process_single(embed_url)
+
     # Vidmoly: prefer .biz domain (the original repo found this was more reliable)
     if "vidmoly.to" in u or "vidmoly.net" in u:
         url = url.replace("vidmoly.to", "vidmoly.biz").replace("vidmoly.net", "vidmoly.biz")
